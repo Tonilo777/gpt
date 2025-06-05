@@ -1,12 +1,11 @@
-
 using System;
-using System.Data;
 using Microsoft.SqlServer.Dts.Runtime;
-using System.Windows.Forms;
 using System.Net;
-using System.IO;
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text;
-using System.Web.Script.Serialization;
+using System.Text.Json;
+using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Threading;
 
@@ -36,6 +35,11 @@ namespace ST_PowerBIRefresh
         {
             public List<RefreshValue> value { get; set; }
         }
+        private static readonly HttpClient HttpClient = new HttpClient();
+        private const string TokenUrlFormat = "https://login.microsoftonline.com/{0}/oauth2/v2.0/token";
+        private const string RefreshUrlFormat = "https://api.powerbi.com/v1.0/myorg/groups/{0}/datasets/{1}/refreshes";
+        private const string StatusUrlFormat = "https://api.powerbi.com/v1.0/myorg/groups/{0}/datasets/{1}/refreshes?$top=1";
+        private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
 
         public void Main()
         {
@@ -60,7 +64,7 @@ namespace ST_PowerBIRefresh
                 LogInfo($"Tenant ID: {tenantId.Substring(0, 8)}...", fireAgain);
                 LogInfo($"Client ID: {clientId.Substring(0, 8)}...", fireAgain);
 
-                string accessToken = GetAccessToken(tenantId, clientId, clientSecret, fireAgain);
+                string accessToken = GetAccessTokenAsync(tenantId, clientId, clientSecret, fireAgain).GetAwaiter().GetResult();
 
                 if (string.IsNullOrEmpty(accessToken))
                     throw new Exception("Failed to obtain access token - token is null or empty");
@@ -72,7 +76,7 @@ namespace ST_PowerBIRefresh
                 LogInfo($"Workspace ID: {workspaceId.Substring(0, 8)}...", fireAgain);
                 LogInfo($"Dataset ID: {datasetId.Substring(0, 8)}...", fireAgain);
 
-                bool refreshTriggered = TriggerDatasetRefresh(accessToken, workspaceId, datasetId, fireAgain);
+                bool refreshTriggered = TriggerDatasetRefreshAsync(accessToken, workspaceId, datasetId, fireAgain).GetAwaiter().GetResult();
 
                 if (refreshTriggered)
                 {
@@ -83,7 +87,7 @@ namespace ST_PowerBIRefresh
                     Thread.Sleep(10000);
 
                     LogInfo("\nSTEP 3: Checking refresh status...", fireAgain);
-                    string status = CheckRefreshStatus(accessToken, workspaceId, datasetId, fireAgain);
+                    string status = CheckRefreshStatusAsync(accessToken, workspaceId, datasetId, fireAgain).GetAwaiter().GetResult();
 
                     if (!string.IsNullOrEmpty(status))
                     {
@@ -127,146 +131,122 @@ namespace ST_PowerBIRefresh
                 throw new ArgumentException("Dataset ID is invalid");
         }
 
-        private string GetAccessToken(string tenantId, string clientId, string clientSecret, bool fireAgain)
+        private async Task<string> GetAccessTokenAsync(string tenantId, string clientId, string clientSecret, bool fireAgain)
         {
-            string tokenEndpoint = $"https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token";
+            string tokenEndpoint = string.Format(TokenUrlFormat, tenantId);
 
             try
             {
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
 
-                using (WebClient client = new WebClient())
+                var content = new FormUrlEncodedContent(new Dictionary<string, string>
                 {
-                    client.Headers[HttpRequestHeader.ContentType] = "application/x-www-form-urlencoded";
+                    {"grant_type", "client_credentials"},
+                    {"scope", "https://analysis.windows.net/powerbi/api/.default"},
+                    {"client_id", clientId},
+                    {"client_secret", clientSecret}
+                });
 
-                    string postData = string.Format(
-                        "grant_type=client_credentials&scope=https://analysis.windows.net/powerbi/api/.default&client_id={0}&client_secret={1}",
-                        Uri.EscapeDataString(clientId),
-                        Uri.EscapeDataString(clientSecret));
+                LogInfo("Sending token request to Azure AD...", fireAgain);
+                using HttpResponseMessage response = await HttpClient.PostAsync(tokenEndpoint, content);
+                string responseText = await response.Content.ReadAsStringAsync();
 
-                    LogInfo("Sending token request to Azure AD...", fireAgain);
-                    string response = client.UploadString(tokenEndpoint, postData);
+                if (!response.IsSuccessStatusCode)
+                    throw new Exception($"Failed to get access token. Status: {response.StatusCode}, Response: {responseText}");
 
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
-                    TokenResponse tokenResponse = serializer.Deserialize<TokenResponse>(response);
+                TokenResponse tokenResponse = JsonSerializer.Deserialize<TokenResponse>(responseText, JsonOptions);
 
-                    if (tokenResponse != null && !string.IsNullOrEmpty(tokenResponse.access_token))
-                    {
-                        LogInfo($"Token received. Type: {tokenResponse.token_type}, Expires in: {tokenResponse.expires_in} seconds", fireAgain);
-                        return tokenResponse.access_token;
-                    }
-
-                    throw new Exception("Token response was null or access_token was empty");
+                if (tokenResponse != null && !string.IsNullOrEmpty(tokenResponse.access_token))
+                {
+                    LogInfo($"Token received. Type: {tokenResponse.token_type}, Expires in: {tokenResponse.expires_in} seconds", fireAgain);
+                    return tokenResponse.access_token;
                 }
+
+                throw new Exception("Token response was null or access_token was empty");
             }
-            catch (WebException webEx)
+            catch (HttpRequestException httpEx)
             {
-                string errorResponse = "";
-                if (webEx.Response != null)
-                {
-                    using (StreamReader reader = new StreamReader(webEx.Response.GetResponseStream()))
-                    {
-                        errorResponse = reader.ReadToEnd();
-                    }
-                }
-                throw new Exception($"Failed to get access token. Status: {webEx.Status}, Response: {errorResponse}", webEx);
+                throw new Exception($"Failed to get access token: {httpEx.Message}", httpEx);
             }
         }
 
-        private bool TriggerDatasetRefresh(string accessToken, string workspaceId, string datasetId, bool fireAgain)
+        private async Task<bool> TriggerDatasetRefreshAsync(string accessToken, string workspaceId, string datasetId, bool fireAgain)
         {
-            string refreshUrl = $"https://api.powerbi.com/v1.0/myorg/groups/{workspaceId}/datasets/{datasetId}/refreshes";
+            string refreshUrl = string.Format(RefreshUrlFormat, workspaceId, datasetId);
 
             try
             {
                 ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(refreshUrl);
-                request.Method = "POST";
-                request.Headers.Add("Authorization", $"Bearer {accessToken}");
-                request.ContentType = "application/json";
-                request.ContentLength = 0;
-                request.Accept = "application/json";
-                request.UserAgent = "SSIS-PowerBI-Refresh/1.0";
+                using var request = new HttpRequestMessage(HttpMethod.Post, refreshUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                request.Content = new StringContent(string.Empty, Encoding.UTF8, "application/json");
+                request.Headers.UserAgent.ParseAdd("SSIS-PowerBI-Refresh/1.0");
 
                 LogInfo("Sending refresh request to Power BI API...", fireAgain);
 
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                using HttpResponseMessage response = await HttpClient.SendAsync(request);
+                string responseText = await response.Content.ReadAsStringAsync();
+
+                LogInfo($"Power BI API Response: {response.StatusCode} - {response.ReasonPhrase}", fireAgain);
+
+                if (response.IsSuccessStatusCode || response.StatusCode == HttpStatusCode.Accepted)
+                    return true;
+
+                if ((int)response.StatusCode == 429)
                 {
-                    LogInfo($"Power BI API Response: {response.StatusCode} - {response.StatusDescription}", fireAgain);
-                    return response.StatusCode == HttpStatusCode.Accepted ||
-                           response.StatusCode == HttpStatusCode.OK ||
-                           response.StatusCode == HttpStatusCode.Created ||
-                           response.StatusCode == HttpStatusCode.NoContent;
+                    string retryAfter = response.Headers.RetryAfter?.Delta?.TotalSeconds.ToString() ?? "unknown";
+                    LogWarning($"Too many refresh requests. Rate limit exceeded. Retry after (seconds): {retryAfter}");
+                    return false;
                 }
+
+                if (response.StatusCode == HttpStatusCode.Unauthorized)
+                    throw new Exception("Unauthorized access. Check token and permissions.");
+
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                    throw new Exception($"Dataset or workspace not found. Workspace: {workspaceId}, Dataset: {datasetId}");
+
+                throw new Exception($"Failed to trigger refresh. Status: {response.StatusCode}, Error: {responseText}");
             }
-            catch (WebException webEx)
+            catch (HttpRequestException webEx)
             {
-                if (webEx.Response != null)
-                {
-                    HttpWebResponse errorResponse = (HttpWebResponse)webEx.Response;
-                    string errorContent = "";
-                    using (StreamReader reader = new StreamReader(errorResponse.GetResponseStream()))
-                    {
-                        errorContent = reader.ReadToEnd();
-                    }
-
-                    if ((int)errorResponse.StatusCode == 429)
-                    {
-                        string retryAfter = errorResponse.Headers["Retry-After"] ?? "unknown";
-                        LogWarning($"Too many refresh requests. Rate limit exceeded. Retry after (seconds): {retryAfter}");
-                        return false;
-                    }
-
-                    if (errorResponse.StatusCode == HttpStatusCode.Unauthorized)
-                        throw new Exception("Unauthorized access. Check token and permissions.");
-
-                    if (errorResponse.StatusCode == HttpStatusCode.NotFound)
-                        throw new Exception($"Dataset or workspace not found. Workspace: {workspaceId}, Dataset: {datasetId}");
-
-                    throw new Exception($"Failed to trigger refresh. Status: {errorResponse.StatusCode}, Error: {errorContent}");
-                }
-
                 throw new Exception($"Failed to trigger refresh: {webEx.Message}", webEx);
             }
         }
 
-        private string CheckRefreshStatus(string accessToken, string workspaceId, string datasetId, bool fireAgain)
+        private async Task<string> CheckRefreshStatusAsync(string accessToken, string workspaceId, string datasetId, bool fireAgain)
         {
-            string statusUrl = $"https://api.powerbi.com/v1.0/myorg/groups/{workspaceId}/datasets/{datasetId}/refreshes?$top=1";
+            string statusUrl = string.Format(StatusUrlFormat, workspaceId, datasetId);
 
             try
             {
-                HttpWebRequest request = (HttpWebRequest)WebRequest.Create(statusUrl);
-                request.Method = "GET";
-                request.Headers.Add("Authorization", $"Bearer {accessToken}");
-                request.Accept = "application/json";
-                request.UserAgent = "SSIS-PowerBI-Refresh/1.0";
+                using var request = new HttpRequestMessage(HttpMethod.Get, statusUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+                request.Headers.UserAgent.ParseAdd("SSIS-PowerBI-Refresh/1.0");
 
-                using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
-                using (StreamReader reader = new StreamReader(response.GetResponseStream()))
+                using HttpResponseMessage response = await HttpClient.SendAsync(request);
+                string responseText = await response.Content.ReadAsStringAsync();
+
+                if (!response.IsSuccessStatusCode)
+                    throw new Exception($"Failed to check refresh status. Status: {response.StatusCode}, Error: {responseText}");
+
+                RefreshResponse refreshResponse = JsonSerializer.Deserialize<RefreshResponse>(responseText, JsonOptions);
+
+                if (refreshResponse?.value?.Count > 0)
                 {
-                    string responseText = reader.ReadToEnd();
+                    var latestRefresh = refreshResponse.value[0];
+                    LogInfo($"Refresh ID: {latestRefresh.id}", fireAgain);
+                    LogInfo($"Refresh Type: {latestRefresh.refreshType}", fireAgain);
+                    LogInfo($"Start Time: {latestRefresh.startTime}", fireAgain);
+                    LogInfo($"Status: {latestRefresh.status}", fireAgain);
 
-                    JavaScriptSerializer serializer = new JavaScriptSerializer();
-                    RefreshResponse refreshResponse = serializer.Deserialize<RefreshResponse>(responseText);
+                    if (!string.IsNullOrEmpty(latestRefresh.serviceExceptionJson))
+                        LogWarning($"Service Exception: {latestRefresh.serviceExceptionJson}");
 
-                    if (refreshResponse?.value?.Count > 0)
-                    {
-                        var latestRefresh = refreshResponse.value[0];
-                        LogInfo($"Refresh ID: {latestRefresh.id}", fireAgain);
-                        LogInfo($"Refresh Type: {latestRefresh.refreshType}", fireAgain);
-                        LogInfo($"Start Time: {latestRefresh.startTime}", fireAgain);
-                        LogInfo($"Status: {latestRefresh.status}", fireAgain);
-
-                        if (!string.IsNullOrEmpty(latestRefresh.serviceExceptionJson))
-                            LogWarning($"Service Exception: {latestRefresh.serviceExceptionJson}");
-
-                        return latestRefresh.status;
-                    }
-
-                    LogWarning("No refresh history found for this dataset");
-                    return "Unknown";
+                    return latestRefresh.status;
                 }
+
+                LogWarning("No refresh history found for this dataset");
+                return "Unknown";
             }
             catch (Exception ex)
             {
